@@ -136,38 +136,27 @@ class P2PSimulator:
 
     def _generate_listening_event(self) -> dict:
         """
-        Génère un événement d'écoute.
-
-        TODO : compléter ce squelette pour générer un événement réaliste.
-        Champs attendus :
-            - event_id     : UUID unique
-            - user_id      : UUID utilisateur (depuis SAMPLE_USERS)
-            - track_id     : UUID du morceau (depuis SAMPLE_TRACKS)
-            - source_peer  : UUID du peer qui sert le morceau
-            - timestamp    : ISO 8601 (datetime.utcnow())
-            - duration_ms  : durée écoutée (entre 30 000 et track.duration_ms)
-            - device_type  : depuis DEVICE_TYPES
-            - geo_country  : depuis GEO_COUNTRIES
-            - completed    : bool (True si duration_ms > 30s)
-            - event_source : depuis EVENT_SOURCES
-
-        En mode "fraud" (Phase 2) :
-            - 30% des events : duration_ms < 5000 (écoute trop courte = bot)
-            - 10% : même user_id sur 20 tracks en <10 secondes
-
-        En mode "late_events" (Phase 2) :
-            - timestamp décalé de -5 à -30 minutes dans le passé
+        Génère un événement d'écoute réaliste.
         """
         track = random.choice(SAMPLE_TRACKS)
 
-        # TODO : compléter ici
+        # Durée écoutée : entre 30s et la durée totale du morceau
+        duration_ms = random.randint(30_000, track["duration_ms"])
+
+        # completed = True si l'utilisateur a écouté plus de 30s
+        completed = duration_ms >= 30_000
+
         event = {
-            "event_id":    str(uuid.uuid4()),
-            "user_id":     random.choice(SAMPLE_USERS),
-            "track_id":    track["id"],
-            "source_peer": random.choice(self.active_peers),
-            "timestamp":   datetime.utcnow().isoformat() + "Z",
-            # À compléter...
+            "event_id":     str(uuid.uuid4()),
+            "user_id":      random.choice(SAMPLE_USERS),
+            "track_id":     track["id"],
+            "source_peer":  random.choice(self.active_peers),
+            "timestamp":    datetime.utcnow().isoformat() + "Z",
+            "duration_ms":  duration_ms,
+            "device_type":  random.choice(DEVICE_TYPES),
+            "geo_country":  random.choice(GEO_COUNTRIES),
+            "completed":    completed,
+            "event_source": random.choice(EVENT_SOURCES),
         }
 
         # Mode fraud (Phase 2) — décommenter
@@ -185,28 +174,47 @@ class P2PSimulator:
 
     def _generate_p2p_network_event(self) -> dict:
         """
-        Génère un événement réseau P2P.
-
-        TODO : compléter pour générer des événements de type :
-            - peer_connect    : un peer rejoint le réseau
-            - peer_disconnect : un peer quitte le réseau
-            - chunk_transfer  : transfert d'un chunk audio entre peers
-            - cache_hit       : le morceau était en cache local
-            - cache_miss      : téléchargement depuis un autre peer nécessaire
+        Génère un événement réseau P2P selon le type tiré aléatoirement.
         """
         event_type = random.choice([
             "peer_connect", "peer_disconnect",
             "chunk_transfer", "cache_hit", "cache_miss"
         ])
 
-        # TODO : compléter selon event_type
+        peer_id = random.choice(self.active_peers)
+
+        # Champs communs
         event = {
             "event_id":   str(uuid.uuid4()),
             "event_type": event_type,
-            "peer_id":    random.choice(self.active_peers),
+            "peer_id":    peer_id,
             "timestamp":  datetime.utcnow().isoformat() + "Z",
-            # À compléter...
         }
+
+        # Champs spécifiques selon le type d'événement
+        if event_type == "peer_connect":
+            event["ip_address"] = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+            event["latency_ms"] = random.randint(5, 200)
+
+        elif event_type == "peer_disconnect":
+            event["reason"] = random.choice(["timeout", "user_quit", "network_error", "graceful"])
+            event["session_duration_s"] = random.randint(30, 3600)
+
+        elif event_type == "chunk_transfer":
+            event["from_peer"]   = random.choice(self.active_peers)
+            event["to_peer"]     = peer_id
+            event["chunk_size"]  = random.randint(64_000, 512_000)   # bytes
+            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["success"]     = random.random() > 0.05             # 95% succès
+
+        elif event_type == "cache_hit":
+            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["saved_bytes"] = random.randint(64_000, 512_000)
+
+        elif event_type == "cache_miss":
+            event["track_id"]       = random.choice(SAMPLE_TRACKS)["id"]
+            event["fallback_peer"]  = random.choice(self.active_peers)
+
         return event
 
     # ── Publication ──────────────────────────────────────────
@@ -222,11 +230,13 @@ class P2PSimulator:
 
     def _publish_to_redis(self, channel: str, payload: str):
         """
-        TODO : publier payload dans le channel Redis via pub/sub.
-        Utiliser self.redis.publish(channel, payload)
-        Gérer l'exception si Redis est indisponible (log + skip).
+        Publie payload dans le channel Redis via pub/sub.
+        Skip silencieusement si Redis est indisponible.
         """
-        raise NotImplementedError("TODO : implémenter _publish_to_redis()")
+        try:
+            self.redis.publish(channel, payload)
+        except redis.RedisError as e:
+            logger.error(f"Redis indisponible, événement ignoré — channel={channel} | erreur={e}")
 
     # def _publish_to_kafka(self, topic: str, key: str, payload: str):
     #     """
