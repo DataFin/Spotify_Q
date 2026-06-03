@@ -1,171 +1,196 @@
-# RUNBOOK SPOTIFY — Procédures incidents
+# RUNBOOK.md — Spotify Data Platform
 
-> Ce document doit être complété par votre groupe au fur et à mesure de la semaine.
-> Un bon runbook = ce dont vous auriez eu besoin pendant la panne.
-
----
-
-## Incidents Phase 1 — Airflow / Batch
-
-### INC-01 — DAG bloqué en "running" depuis > 30 minutes
-
-**Symptômes :** Une tâche reste en état `running` dans l'UI Airflow.
-
-**Diagnostic :**
-```bash
-# Voir les logs de la tâche
-docker compose logs airflow-worker -f
-
-# Lister les tâches actives
-docker exec airflow-scheduler airflow tasks states-for-dag-run <dag_id> <run_id>
-```
-
-**Résolution :**
-```bash
-# Marquer la tâche comme failed manuellement
-docker exec airflow-scheduler airflow tasks clear <dag_id> -t <task_id> --yes
-
-# Ou tuer le worker et le relancer
-docker compose restart airflow-worker
-```
-
-**Cause probable :** → À compléter par votre groupe après avoir rencontré cet incident
+## Incidents les plus probables et procédures de résolution
 
 ---
 
-### INC-02 — PostgreSQL : `too many connections`
+## Incident #1 — `listening_events` reste vide après plusieurs DAGRuns
 
-**Symptômes :** Les tâches Airflow échouent avec `FATAL: too many connections`.
-
-**Diagnostic :**
+### Symptômes
 ```sql
-SELECT count(*), state FROM pg_stat_activity GROUP BY state;
-SELECT max_conn FROM pg_settings WHERE name='max_connections';
+SELECT COUNT(*) FROM listening_events;
+-- count = 0
 ```
 
-**Résolution :**
-```bash
-# Augmenter max_connections dans docker-compose
-# PostgreSQL environment: POSTGRES_MAX_CONNECTIONS: 200
+### Causes possibles et diagnostic
 
-# Court terme : killer les connexions idle
-# SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle';
+**Cause 1 — Le simulateur ne tourne pas**
+```bash
+docker exec -it spotify_q-redis-1 redis-cli -n 1 llen listening_events_queue
+# Si 0 → simulateur arrêté
+```
+**Solution :**
+```bash
+python -m src.p2p_simulator.simulator --peers 10 --rate 3
 ```
 
-**Prévention :** → À compléter (hint : Airflow pools)
-
----
-
-### INC-03 — MinIO inaccessible depuis Airflow
-
-**Symptômes :** Les tâches de lecture/écriture Parquet échouent avec `Connection refused`.
-
-**Diagnostic :**
+**Cause 2 — Le simulateur utilise publish au lieu de lpush**
 ```bash
-docker compose ps minio
-curl http://localhost:9000/minio/health/live
+grep "publish\|lpush" src/p2p_simulator/simulator.py
+# Si "publish" → bug
+```
+**Solution :**
+```bash
+# Corriger la ligne dans simulator.py
+# self.redis.publish(channel, payload)
+# →
+# self.redis.lpush(channel + "_queue", payload)
 ```
 
-**Résolution :**
+**Cause 3 — Violation de contrainte PostgreSQL**
 ```bash
-docker compose restart minio
-# Attendre 10s puis relancer le DAGRun
+docker logs spotify_q-airflow-worker-1 --tail 50 2>&1 | grep "WARNING\|ERROR"
+```
+**Solution :** Vérifier les logs et corriger la contrainte violée (FK, type, etc.)
+
+**Cause 4 — Catalogue vide (unknown_track)**
+```bash
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT COUNT(*) FROM tracks;"
+# Si 0 → lancer catalog_ingestion_pipeline
 ```
 
----
-
-## Incidents Phase 2 — Kafka / Spark
-
-### INC-04 — Consumer lag Kafka qui explose
-
-**Symptômes :** Kafka UI → consumer group `spark-streaming-trends` → lag > 10 000
-
-**Diagnostic :**
+### Procédure de résolution complète
 ```bash
-# Vérifier le throughput Spark
-docker logs spark-master -f | grep "Batch Duration"
+# 1. Vérifier la queue Redis
+docker exec -it spotify_q-redis-1 redis-cli -n 1 llen listening_events_queue
 
-# Vérifier les ressources
-docker stats spark-worker-1
-```
+# 2. Vérifier le catalogue
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c "SELECT COUNT(*) FROM tracks;"
 
-**Résolution :**
-→ À compléter par votre groupe
+# 3. Vérifier les logs
+docker logs spotify_q-airflow-worker-1 --tail 100 2>&1 | grep "WARNING\|ERROR\|inserted"
 
----
-
-### INC-05 — Job Spark crash avec OutOfMemory
-
-**Symptômes :** `java.lang.OutOfMemoryError: GC overhead limit exceeded`
-
-**Diagnostic :**
-```bash
-docker logs spark-master -f | grep -i "error\|exception\|oom"
-```
-
-**Résolution :**
-```bash
-# Augmenter la mémoire du worker dans docker-compose
-# SPARK_WORKER_MEMORY: 4G
-
-# Réduire le state store : ajouter un TTL sur flatMapGroupsWithState
-# GroupState.setTimeoutDuration("1 hour")
+# 4. Trigger manuellement
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags trigger streaming_events_pipeline
 ```
 
 ---
 
-### INC-06 — Spark ne reprend pas depuis le checkpoint
+## Incident #2 — DAG bloqué en état `running` depuis plus de 30 minutes
 
-**Symptômes :** Après redémarrage, le job repart de zéro au lieu du checkpoint.
+### Symptômes
+- Le DAGRun reste en `running` indéfiniment
+- Les tâches sont en `queued` sans démarrer
 
-**Diagnostic :**
+### Causes possibles et diagnostic
+
+**Cause 1 — Worker Airflow surchargé ou planté**
 ```bash
-# Vérifier que le checkpoint est sur MinIO
-docker exec minio mc ls local/spotify-checkpoints/streaming_trends/
-
-# Vérifier les logs Spark au démarrage
-docker logs spark-master | grep "checkpoint"
+docker compose ps
+# Vérifier que airflow-worker est Up
+docker logs spotify_q-airflow-worker-1 --tail 20
 ```
 
-**Résolution :**
-→ À compléter par votre groupe
+**Cause 2 — ExternalTaskSensor en attente infinie**
+```bash
+# Vérifier si streaming_events_pipeline a un run SUCCESS récent
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags list-runs \
+  -d streaming_events_pipeline
+```
+
+**Cause 3 — Trop de connexions PostgreSQL**
+```bash
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
+```
+**Solution :**
+```bash
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle';"
+```
+
+### Procédure de résolution complète
+```bash
+# 1. Vider la tâche bloquée depuis l'UI Airflow
+# http://localhost:8080 → DAG → tâche → Clear
+
+# 2. Ou via CLI
+docker exec -it spotify_q-airflow-scheduler-1 airflow tasks clear \
+  <dag_id> -t <task_id> --yes
+
+# 3. Redémarrer le worker si nécessaire
+docker compose restart airflow-worker
+
+# 4. Re-trigger le DAG
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags trigger <dag_id>
+```
 
 ---
 
-## Chaos Engineering — Résultats
+## Incident #3 — `daily_streams` vide après le run de `aggregation_pipeline`
 
-> Compléter pendant l'issue #25 (vendredi)
+### Symptômes
+```sql
+SELECT COUNT(*) FROM daily_streams;
+-- count = 0
+```
 
-### Scénario 1 : Arrêt d'un broker Kafka
+### Causes possibles et diagnostic
 
-**Commande :** `docker compose stop kafka-2`
+**Cause 1 — Décalage de date (data_interval_start vs data_interval_end)**
+```bash
+# Vérifier quelle date est dans listening_events
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT DATE(timestamp), COUNT(*) FROM listening_events GROUP BY 1 ORDER BY 1 DESC;"
 
-**Comportement observé :** ...
+# Vérifier la date utilisée par le DAG
+docker exec -it spotify_q-airflow-worker-1 bash -c \
+  "find /opt/airflow/logs -name '*.log' -path '*compute_top*' | sort | tail -1 | xargs grep 'Calcul pour'"
+```
+**Solution :** S'assurer que le DAG utilise `data_interval_end.date()` et non `data_interval_start.date()`
 
-**Recovery automatique :** oui / non — détails : ...
+**Cause 2 — Aucun event avec `completed=TRUE`**
+```bash
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT completed, COUNT(*) FROM listening_events GROUP BY completed;"
+```
+**Solution :** Le filtre `completed = TRUE` dans `compute_top_tracks` est strict — vérifier que le simulateur génère bien des events avec `completed=True`
 
-**Temps de recovery :** ...
+**Cause 3 — ExternalTaskSensor ne trouve pas le run de streaming_events**
+```bash
+# Vérifier que streaming_events_pipeline a un run SUCCESS
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags list-runs \
+  -d streaming_events_pipeline | grep success
+```
+
+### Procédure de résolution complète
+```bash
+# 1. Vérifier les données source
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT DATE(timestamp), COUNT(*) FROM listening_events WHERE completed=TRUE GROUP BY 1;"
+
+# 2. Trigger manuellement
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags trigger aggregation_pipeline
+
+# 3. Vérifier le résultat
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c \
+  "SELECT * FROM daily_streams ORDER BY total_streams DESC LIMIT 5;"
+```
 
 ---
 
-### Scénario 2 : Kill du driver Spark
+## Commandes de monitoring utiles
 
-**Commande :** `docker compose kill spark-master`
+```bash
+# État de tous les DAGs
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags list
 
-**Comportement observé :** ...
+# Derniers runs de tous les DAGs
+docker exec -it spotify_q-airflow-scheduler-1 airflow dags list-runs --limit 10
 
-**Recovery depuis checkpoint :** oui / non — détails : ...
+# État des tables PostgreSQL
+docker exec -it spotify_q-postgres-1 psql -U spotify spotify -c "
+SELECT 'tracks' as table_name, COUNT(*) FROM tracks
+UNION ALL SELECT 'listening_events', COUNT(*) FROM listening_events
+UNION ALL SELECT 'daily_streams', COUNT(*) FROM daily_streams
+UNION ALL SELECT 'recommendations', COUNT(*) FROM recommendations
+UNION ALL SELECT 'dead_letter_events', COUNT(*) FROM dead_letter_events;"
 
-**Doublons introduits :** 0 / N — vérification : ...
+# État Redis
+docker exec -it spotify_q-redis-1 redis-cli -n 1 llen listening_events_queue
+docker exec -it spotify_q-redis-1 redis-cli -n 1 keys "reco:*" | wc -l
 
----
-
-### Scénario 3 : Coupure PostgreSQL
-
-**Commande :** `docker compose stop postgres` (2 minutes) → `docker compose start postgres`
-
-**Comportement observé (Airflow) :** ...
-
-**Comportement observé (Spark) :** ...
-
-**Données perdues :** oui / non — détails : ...
+# Fichiers Parquet MinIO
+docker exec -it spotify_q-minio-1 mc ls local/spotify-parquet --recursive | wc -l
+```
