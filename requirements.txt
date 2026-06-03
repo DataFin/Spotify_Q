@@ -1,39 +1,39 @@
 # SPOTIFY — Dépendances Python
 # pip install -r requirements.txt
 
-# ── Airflow (installer via pip[apache-airflow] ou l'image Docker)
+# -- Airflow (installer via pip[apache-airflow] ou l'image Docker)
 # apache-airflow[celery,postgres,redis,amazon]==2.9.1
 
-# ── Génération de données
-faker==24.0.0
-boto3==1.34.0          # accès MinIO (S3-compatible)
+# -- Génération de données
+faker==40.20.0
+boto3==1.43.19
 
-# ── Transformations
-pandas==2.2.0
-pyarrow==15.0.0        # lecture/écriture Parquet
+# -- Transformations
+pandas==3.0.3
+pyarrow==24.0.0
 
-# ── Base de données
-psycopg2-binary==2.9.9
+# -- Base de données
+psycopg2-binary==2.9.12
 
-# ── Redis
-redis==5.0.1
+# -- Redis
+redis==8.0.0
 
-# ── Kafka (Phase 2)
+# -- Kafka (Phase 2)
 confluent-kafka==2.3.0
-kafka-python==2.0.2    # alternative plus simple
+kafka-python==2.0.2
 
-# ── Spark (Phase 2 — installer via pip ou utiliser le container)
+# -- Spark (Phase 2 — installer via pip ou utiliser le container)
 # pyspark==3.5.0
 
-# ── Machine Learning (recommandations)
+# -- Machine Learning (recommandations)
 scikit-learn==1.4.0
-numpy==1.26.4
+numpy==2.4.6
 
-# ── Tests
-pytest==8.0.0
+# -- Tests
+pytest==9.0.3
 pytest-cov==4.1.0
 pytest-mock==3.12.0
 
-# ── Qualité de code
+# -- Qualité de code
 ruff==0.3.0
 pylint==3.1.0
