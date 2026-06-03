@@ -234,7 +234,7 @@ class P2PSimulator:
         Skip silencieusement si Redis est indisponible.
         """
         try:
-            self.redis.publish(channel, payload)
+            self.redis.lpush(channel + "_queue", payload)
         except redis.RedisError as e:
             logger.error(f"Redis indisponible, événement ignoré — channel={channel} | erreur={e}")
 
