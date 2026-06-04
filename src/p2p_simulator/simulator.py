@@ -95,6 +95,8 @@ class P2PSimulator:
 
         # Connexion Redis
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        self.tracks = self._load_catalog()
+
 
         # Phase 2 — Kafka producer
         # self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
@@ -138,7 +140,8 @@ class P2PSimulator:
         """
         Génère un événement d'écoute réaliste.
         """
-        track = random.choice(SAMPLE_TRACKS)
+        track = random.choice(self.tracks) if self.tracks else random.choice(SAMPLE_TRACKS)
+
 
         # Durée écoutée : entre 30s et la durée totale du morceau
         duration_ms = random.randint(30_000, track["duration_ms"])
@@ -204,15 +207,15 @@ class P2PSimulator:
             event["from_peer"]   = random.choice(self.active_peers)
             event["to_peer"]     = peer_id
             event["chunk_size"]  = random.randint(64_000, 512_000)   # bytes
-            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["track_id"] = random.choice(self.tracks)["id"] if self.tracks else random.choice(SAMPLE_TRACKS)["id"]
             event["success"]     = random.random() > 0.05             # 95% succès
 
         elif event_type == "cache_hit":
-            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["track_id"] = random.choice(self.tracks)["id"] if self.tracks else random.choice(SAMPLE_TRACKS)["id"]
             event["saved_bytes"] = random.randint(64_000, 512_000)
 
         elif event_type == "cache_miss":
-            event["track_id"]       = random.choice(SAMPLE_TRACKS)["id"]
+            event["track_id"] = random.choice(self.tracks)["id"] if self.tracks else random.choice(SAMPLE_TRACKS)["id"]
             event["fallback_peer"]  = random.choice(self.active_peers)
 
         return event
@@ -238,6 +241,37 @@ class P2PSimulator:
         except redis.RedisError as e:
             logger.error(f"Redis indisponible, événement ignoré — channel={channel} | erreur={e}")
 
+    def _load_catalog(self):
+        import psycopg2
+
+        try:
+            conn = psycopg2.connect(
+                host="localhost",
+                dbname="spotify",
+                user="spotify",
+                password="spotify",
+                port=5432
+            )
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT id, duration_ms FROM tracks")
+
+            tracks = []
+            for row in cursor.fetchall():
+                tracks.append({
+                    "id": str(row[0]),
+                    "duration_ms": row[1] or 200000
+                })
+
+            cursor.close()
+            conn.close()
+
+            logger.info(f"{len(tracks)} tracks chargés depuis PostgreSQL ✅")
+            return tracks
+
+        except Exception as e:
+            logger.error(f"Erreur chargement catalogue: {e}")
+            return []
     # def _publish_to_kafka(self, topic: str, key: str, payload: str):
     #     """
     #     TODO Phase 2 : publier payload dans le topic Kafka.
