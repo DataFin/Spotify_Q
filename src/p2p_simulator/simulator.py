@@ -40,7 +40,8 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL = "redis://localhost:6379/1"
+import os
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/1")
 KAFKA_BOOTSTRAP = "kafka-1:9092"       # Phase 2
 
 TOPICS = {
