@@ -2,16 +2,12 @@
 SPOTIFY — Simulateur P2P
 ========================
 Ce simulateur génère des événements réalistes d'un réseau peer-to-peer
-de streaming musical. Il publie dans Redis pub/sub (Phase 1) et dans
-Kafka (Phase 2, après décommentage).
+de streaming musical. Il publie dans Redis (Phase 1) ET dans Kafka (Phase 2).
 
 Usage :
     python -m src.p2p_simulator.simulator --peers 10 --rate 5
+    python -m src.p2p_simulator.simulator --kafka --peers 10 --rate 5
     python -m src.p2p_simulator.simulator --mode fraud --peers 5
-    python -m src.p2p_simulator.simulator --mode late_events
-
-TODO Phase 1 :  Compléter _generate_listening_event() et _publish_to_redis()
-TODO Phase 2 :  Activer _publish_to_kafka() et le mode fraude
 """
 
 import argparse
@@ -22,12 +18,15 @@ import signal
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 
 import redis
 
-# Phase 2 — décommenter quand Kafka est prêt
-# from confluent_kafka import Producer
+# Phase 2 — Kafka
+try:
+    from confluent_kafka import Producer
+    KAFKA_AVAILABLE = True
+except ImportError:
+    KAFKA_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,32 +39,17 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL = "redis://localhost:6379/1"
-KAFKA_BOOTSTRAP = "kafka-1:9092"       # Phase 2
+REDIS_URL        = "redis://localhost:6379/1"
+KAFKA_BOOTSTRAP  = "localhost:9092"
 
 TOPICS = {
     "listening":   "listening_events",
     "p2p_network": "p2p_network_events",
 }
 
-DEVICE_TYPES = ["mobile", "desktop", "smart_speaker", "web", "tv"]
+DEVICE_TYPES  = ["mobile", "desktop", "smart_speaker", "web", "tv"]
 GEO_COUNTRIES = ["FR", "DE", "US", "GB", "ES", "IT", "BR", "JP", "KR", "AU"]
-EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # pondéré : 60% P2P
-
-
-# ─────────────────────────────────────────────────────────────
-# DONNÉES SIMULÉES
-# ─────────────────────────────────────────────────────────────
-
-# Ces UUIDs seront remplacés par les vrais IDs depuis PostgreSQL
-# Une fois votre base peuplée, charger dynamiquement avec _load_catalog()
-SAMPLE_TRACKS = [
-    {"id": str(uuid.uuid4()), "title": f"Track {i}", "duration_ms": random.randint(120000, 300000)}
-    for i in range(50)
-]
-
-SAMPLE_USERS = [str(uuid.uuid4()) for _ in range(200)]
-SAMPLE_PEERS = [str(uuid.uuid4()) for _ in range(20)]
+EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -73,39 +57,76 @@ SAMPLE_PEERS = [str(uuid.uuid4()) for _ in range(20)]
 # ─────────────────────────────────────────────────────────────
 
 class P2PSimulator:
-    """
-    Simulateur du réseau P2P SPOTIFY.
-
-    Génère deux types d'événements :
-    - listening_events   : un utilisateur écoute un morceau via un peer
-    - p2p_network_events : connexion/déconnexion/transfert entre peers
-    """
 
     def __init__(
         self,
         n_peers: int = 10,
         events_per_second: float = 5.0,
         mode: str = "normal",
+        enable_kafka: bool = False,
     ):
-        self.n_peers = n_peers
+        self.n_peers           = n_peers
         self.events_per_second = events_per_second
-        self.mode = mode
-        self.running = True
-        self.event_count = 0
+        self.mode              = mode
+        self.enable_kafka      = enable_kafka and KAFKA_AVAILABLE
+        self.running           = True
+        self.event_count       = 0
 
         # Connexion Redis
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
 
-        # Phase 2 — Kafka producer
-        # self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
+        # Kafka Producer (Phase 2)
+        self.kafka_producer = None
+        if self.enable_kafka:
+            self.kafka_producer = Producer({
+                "bootstrap.servers":  KAFKA_BOOTSTRAP,
+                "acks":               "all",
+                "enable.idempotence": True,
+                "retries":            3,
+                "retry.backoff.ms":   500,
+            })
+            logger.info("Kafka producer initialisé")
 
-        # Peers actifs simulés
+        # Charger les vrais track_id depuis PostgreSQL
+        self.track_ids = self._load_track_ids()
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
+        self.sample_users = [str(uuid.uuid4()) for _ in range(200)]
 
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
-        logger.info(f"Simulateur démarré | mode={mode} | peers={n_peers} | rate={events_per_second} evt/s")
+        mode_str = "normal" if not enable_kafka else "normal+kafka"
+        logger.info(
+            f"Simulateur démarré | mode={mode_str} | peers={n_peers} | rate={events_per_second} evt/s"
+        )
+
+    def _load_track_ids(self) -> list:
+        """
+        Charge les vrais track_id depuis PostgreSQL.
+        Fallback sur des UUIDs aléatoires si PostgreSQL est indisponible.
+        """
+        try:
+            import psycopg2
+            conn = psycopg2.connect(
+                host="localhost",
+                port=5432,
+                dbname="spotify",
+                user="spotify",
+                password="spotify",
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM tracks")
+            ids = [str(row[0]) for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            if ids:
+                logger.info(f"Chargé {len(ids)} tracks depuis PostgreSQL")
+                return ids
+        except Exception as e:
+            logger.warning(f"PostgreSQL indisponible, utilisation de tracks aléatoires : {e}")
+
+        # Fallback
+        return [str(uuid.uuid4()) for _ in range(50)]
 
     def run(self):
         """Boucle principale : génère et publie des événements en continu."""
@@ -113,7 +134,6 @@ class P2PSimulator:
 
         while self.running:
             try:
-                # Alterner listening et réseau P2P (80% / 20%)
                 if random.random() < 0.8:
                     event = self._generate_listening_event()
                     self._publish_event("listening", event)
@@ -132,26 +152,25 @@ class P2PSimulator:
                 logger.error(f"Erreur lors de la génération d'événement : {e}")
                 time.sleep(1)
 
+        # Flush Kafka avant d'arrêter
+        if self.kafka_producer:
+            self.kafka_producer.flush(timeout=10)
+
     # ── Génération d'événements ──────────────────────────────
 
     def _generate_listening_event(self) -> dict:
-        """
-        Génère un événement d'écoute réaliste.
-        """
-        track = random.choice(SAMPLE_TRACKS)
-
-        # Durée écoutée : entre 30s et la durée totale du morceau
-        duration_ms = random.randint(30_000, track["duration_ms"])
-
-        # completed = True si l'utilisateur a écouté plus de 30s
-        completed = duration_ms >= 30_000
+        track_id    = random.choice(self.track_ids)
+        duration_ms = random.randint(30_000, 300_000)
+        completed   = duration_ms >= 30_000
 
         event = {
             "event_id":     str(uuid.uuid4()),
-            "user_id":      random.choice(SAMPLE_USERS),
-            "track_id":     track["id"],
+            "user_id":      random.choice(self.sample_users),
+            "track_id":     track_id,
             "source_peer":  random.choice(self.active_peers),
-            "timestamp":    datetime.utcnow().isoformat() + "Z",
+            "timestamp":    datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+                            if hasattr(datetime, "UTC")
+                            else datetime.utcnow().isoformat() + "Z",
             "duration_ms":  duration_ms,
             "device_type":  random.choice(DEVICE_TYPES),
             "geo_country":  random.choice(GEO_COUNTRIES),
@@ -159,31 +178,26 @@ class P2PSimulator:
             "event_source": random.choice(EVENT_SOURCES),
         }
 
-        # Mode fraud (Phase 2) — décommenter
-        # if self.mode == "fraud" and random.random() < 0.3:
-        #     event["duration_ms"] = random.randint(100, 4999)
-        #     event["completed"] = False
+        # Mode fraud
+        if self.mode == "fraud" and random.random() < 0.3:
+            event["duration_ms"] = random.randint(100, 4999)
+            event["completed"]   = False
 
-        # Mode late_events (Phase 2) — décommenter
-        # if self.mode == "late_events" and random.random() < 0.4:
-        #     delay_minutes = random.randint(5, 30)
-        #     ts = datetime.utcnow() - timedelta(minutes=delay_minutes)
-        #     event["timestamp"] = ts.isoformat() + "Z"
+        # Mode late_events
+        if self.mode == "late_events" and random.random() < 0.4:
+            delay_minutes    = random.randint(5, 30)
+            ts               = datetime.utcnow() - timedelta(minutes=delay_minutes)
+            event["timestamp"] = ts.isoformat() + "Z"
 
         return event
 
     def _generate_p2p_network_event(self) -> dict:
-        """
-        Génère un événement réseau P2P selon le type tiré aléatoirement.
-        """
         event_type = random.choice([
             "peer_connect", "peer_disconnect",
-            "chunk_transfer", "cache_hit", "cache_miss"
+            "chunk_transfer", "cache_hit", "cache_miss",
         ])
-
         peer_id = random.choice(self.active_peers)
 
-        # Champs communs
         event = {
             "event_id":   str(uuid.uuid4()),
             "event_type": event_type,
@@ -191,64 +205,73 @@ class P2PSimulator:
             "timestamp":  datetime.utcnow().isoformat() + "Z",
         }
 
-        # Champs spécifiques selon le type d'événement
         if event_type == "peer_connect":
             event["ip_address"] = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
             event["latency_ms"] = random.randint(5, 200)
-
         elif event_type == "peer_disconnect":
-            event["reason"] = random.choice(["timeout", "user_quit", "network_error", "graceful"])
+            event["reason"]             = random.choice(["timeout", "user_quit", "network_error", "graceful"])
             event["session_duration_s"] = random.randint(30, 3600)
-
         elif event_type == "chunk_transfer":
             event["from_peer"]   = random.choice(self.active_peers)
             event["to_peer"]     = peer_id
-            event["chunk_size"]  = random.randint(64_000, 512_000)   # bytes
-            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
-            event["success"]     = random.random() > 0.05             # 95% succès
-
+            event["chunk_size"]  = random.randint(64_000, 512_000)
+            event["track_id"]    = random.choice(self.track_ids)
+            event["success"]     = random.random() > 0.05
         elif event_type == "cache_hit":
-            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["track_id"]    = random.choice(self.track_ids)
             event["saved_bytes"] = random.randint(64_000, 512_000)
-
         elif event_type == "cache_miss":
-            event["track_id"]       = random.choice(SAMPLE_TRACKS)["id"]
-            event["fallback_peer"]  = random.choice(self.active_peers)
+            event["track_id"]      = random.choice(self.track_ids)
+            event["fallback_peer"] = random.choice(self.active_peers)
 
         return event
 
     # ── Publication ──────────────────────────────────────────
 
     def _publish_event(self, topic_key: str, event: dict):
-        """Publie un événement dans Redis et (Phase 2) dans Kafka."""
+        """Publie un événement dans Redis ET Kafka (si activé)."""
         payload = json.dumps(event)
         channel = TOPICS[topic_key]
 
+        # Phase 1 — Redis (toujours actif)
         self._publish_to_redis(channel, payload)
-        # Phase 2 — décommenter
-        # self._publish_to_kafka(channel, event.get("user_id", ""), payload)
+
+        # Phase 2 — Kafka (si activé)
+        if self.enable_kafka and self.kafka_producer:
+            self._publish_to_kafka(channel, event.get("user_id", ""), payload)
 
     def _publish_to_redis(self, channel: str, payload: str):
-        """
-        Publie payload dans le channel Redis via pub/sub.
-        Skip silencieusement si Redis est indisponible.
-        """
+        """Publie dans la queue Redis via lpush."""
         try:
-            self.redis.publish(channel, payload)
+            self.redis.lpush(channel + "_queue", payload)
         except redis.RedisError as e:
-            logger.error(f"Redis indisponible, événement ignoré — channel={channel} | erreur={e}")
+            logger.error(f"Redis indisponible — channel={channel} | erreur={e}")
 
-    # def _publish_to_kafka(self, topic: str, key: str, payload: str):
-    #     """
-    #     TODO Phase 2 : publier payload dans le topic Kafka.
-    #     - key     : utilisé pour le partitionnement (user_id ou peer_id)
-    #     - acks    : 'all' pour la durabilité
-    #     - Gérer le callback de confirmation (delivery_report)
-    #     """
-    #     raise NotImplementedError("TODO Phase 2 : implémenter _publish_to_kafka()")
+    def _publish_to_kafka(self, topic: str, key: str, payload: str):
+        """
+        Publie dans le topic Kafka.
+        - acks=all + enable.idempotence=True → exactly-once
+        - key = user_id pour le partitionnement cohérent
+        """
+        def delivery_report(err, msg):
+            if err:
+                logger.error(f"Kafka delivery failed — topic={msg.topic()} | err={err}")
+
+        try:
+            self.kafka_producer.produce(
+                topic=topic,
+                key=key.encode("utf-8") if key else None,
+                value=payload.encode("utf-8"),
+                callback=delivery_report,
+            )
+            self.kafka_producer.poll(0)  # déclenche les callbacks
+        except Exception as e:
+            logger.error(f"Kafka indisponible — topic={topic} | erreur={e}")
 
     def _shutdown(self, signum, frame):
-        logger.info(f"Arrêt du simulateur (signal {signum}) — {self.event_count} événements publiés")
+        logger.info(
+            f"Arrêt du simulateur (signal {signum}) — {self.event_count} événements publiés"
+        )
         self.running = False
 
 
@@ -258,17 +281,18 @@ class P2PSimulator:
 
 def main():
     parser = argparse.ArgumentParser(description="SPOTIFY P2P Simulator")
-    parser.add_argument("--peers",  type=int,   default=10,     help="Nombre de peers simulés")
-    parser.add_argument("--rate",   type=float, default=5.0,    help="Événements par seconde")
+    parser.add_argument("--peers",  type=int,   default=10,      help="Nombre de peers simulés")
+    parser.add_argument("--rate",   type=float, default=5.0,     help="Événements par seconde")
     parser.add_argument("--mode",   type=str,   default="normal",
-                        choices=["normal", "fraud", "late_events", "chaos"],
-                        help="Mode de simulation")
+                        choices=["normal", "fraud", "late_events", "chaos"])
+    parser.add_argument("--kafka",  action="store_true",         help="Activer la publication Kafka")
     args = parser.parse_args()
 
     simulator = P2PSimulator(
         n_peers=args.peers,
         events_per_second=args.rate,
         mode=args.mode,
+        enable_kafka=args.kafka,
     )
     simulator.run()
 
