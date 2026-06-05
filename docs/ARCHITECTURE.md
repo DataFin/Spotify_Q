@@ -1,4 +1,4 @@
-# Architecture SPOTIFY — Groupe DataFin
+# Architecture SPOTIFY — Groupe Q
 
 ---
 
