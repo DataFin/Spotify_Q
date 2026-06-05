@@ -156,11 +156,17 @@ docker exec -it spotify_q-airflow-scheduler-1 airflow dags trigger catalog_inges
 docker exec -it spotify_q-airflow-scheduler-1 airflow dags trigger streaming_events_pipeline
 
 # 9. Lancer le job Spark Phase 2
+# Préparer le cache Ivy (première fois uniquement)
 docker exec --user root spotify_q-spark-master-1 mkdir -p /home/spark/.ivy2/cache
 docker exec --user root spotify_q-spark-master-1 chown -R spark:spark /home/spark/.ivy2
+
+# Lancer le job (sink console — valide la lecture Kafka)
 docker exec spotify_q-spark-master-1 /opt/spark/bin/spark-submit \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 \
   /opt/spark-jobs/streaming_trends_job.py
+
+# Les events JSON apparaissent dans les logs toutes les 10 secondes :
+# docker logs spotify_q-spark-master-1 -f
 ```
 
 ---
